@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import { pool } from "./db";
 import { runMigrations } from "./migrate";
 import { logsRoutes } from "./routes/logs";
+import { startRetentionScheduler } from "./retention";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const HOST = "0.0.0.0";
@@ -34,6 +35,7 @@ async function start(): Promise<void> {
     await runMigrations(pool);
     ready = true;
     console.log("migrations complete, ready to accept traffic");
+    startRetentionScheduler(pool);
   } catch (err) {
     console.error("migration failed", err);
     process.exit(1);

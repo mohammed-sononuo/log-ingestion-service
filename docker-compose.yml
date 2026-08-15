@@ -6,6 +6,8 @@ services:
     environment:
       PORT: 8080
       DATABASE_URL: postgres://loguser:logpass@db:5432/logs
+      RETENTION_DAYS: 30
+      RETENTION_CHECK_INTERVAL_MS: 3600000
     depends_on:
       db:
         condition: service_healthy

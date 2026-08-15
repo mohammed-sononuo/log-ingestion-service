@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "retention:run": "node dist/scripts/runRetentionOnce.js"
   },
   "dependencies": {
     "fastify": "^4.28.1",
