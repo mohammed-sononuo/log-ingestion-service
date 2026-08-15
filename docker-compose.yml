@@ -20,7 +20,7 @@ services:
       POSTGRES_PASSWORD: logpass
       POSTGRES_DB: logs
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     cpus: 1
