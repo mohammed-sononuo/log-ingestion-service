@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start services
+        run: docker compose up -d
+
+      - name: Wait for health check
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health | grep -q '"status":"ok"'; then
+              echo "service healthy after ${i} attempt(s)"
+              exit 0
+            fi
+            echo "waiting for service to become healthy (attempt ${i})..."
+            sleep 2
+          done
+          echo "service did not become healthy in time"
+          docker compose logs
+          exit 1
+
+      - name: Smoke test - POST /logs
+        run: |
+          set -e
+          ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          status=$(curl -s -o /tmp/post_resp.json -w "%{http_code}" -X POST http://localhost:8080/logs \
+            -H "Content-Type: application/json" \
+            -d "{\"logs\":[{\"timestamp\":\"${ts}\",\"level\":\"info\",\"service\":\"ci-smoke\",\"message\":\"smoke test log\"}]}")
+          echo "status=${status}"
+          cat /tmp/post_resp.json
+          test "${status}" = "200"
+          grep -q '"accepted":1' /tmp/post_resp.json
+
+      - name: Smoke test - GET /logs
+        run: |
+          set -e
+          status=$(curl -s -o /tmp/get_resp.json -w "%{http_code}" "http://localhost:8080/logs?service=ci-smoke&limit=5")
+          echo "status=${status}"
+          cat /tmp/get_resp.json
+          test "${status}" = "200"
+          grep -q '"logs"' /tmp/get_resp.json
+
+      - name: Smoke test - GET /logs/aggregate
+        run: |
+          set -e
+          since=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S.000Z)
+          until_ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          status=$(curl -s -o /tmp/agg_resp.json -w "%{http_code}" "http://localhost:8080/logs/aggregate?since=${since}&until=${until_ts}&bucket=1m")
+          echo "status=${status}"
+          cat /tmp/agg_resp.json
+          test "${status}" = "200"
+          grep -q '"buckets"' /tmp/agg_resp.json
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
