@@ -8,6 +8,7 @@ services:
       DATABASE_URL: postgres://loguser:logpass@db:5432/logs
       RETENTION_DAYS: 30
       RETENTION_CHECK_INTERVAL_MS: 3600000
+      PGPOOL_MAX: 10
     depends_on:
       db:
         condition: service_healthy
@@ -17,6 +18,19 @@ services:
 
   db:
     image: postgres:16-alpine
+    # shared_buffers/effective_cache_size are sized for this container's 1GB
+    # limit (Postgres' own defaults assume the host's full memory, not the
+    # cgroup limit). max_parallel_workers_per_gather=0 avoids spawning worker
+    # processes that just add context-switch overhead when only 1 CPU is
+    # available to schedule them on.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_parallel_workers_per_gather=0
     environment:
       POSTGRES_USER: loguser
       POSTGRES_PASSWORD: logpass
