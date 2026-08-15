@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { pool } from "../db";
-import { validateBatch, validateLogsQuery, encodeCursor } from "../validation/logs";
-import { insertLogsBulk, queryLogs, cursorFromRow } from "../queries/logs";
+import { validateBatch, validateLogsQuery, validateAggregateQuery, encodeCursor } from "../validation/logs";
+import { insertLogsBulk, queryLogs, cursorFromRow, aggregateLogs } from "../queries/logs";
 
 export async function logsRoutes(app: FastifyInstance): Promise<void> {
   app.post("/logs", async (req, reply) => {
@@ -51,5 +51,23 @@ export async function logsRoutes(app: FastifyInstance): Promise<void> {
     const next_cursor = hasMore && rows.length > 0 ? encodeCursor(cursorFromRow(rows[rows.length - 1])) : null;
 
     return { logs, next_cursor };
+  });
+
+  app.get("/logs/aggregate", async (req, reply) => {
+    const validation = validateAggregateQuery(req.query as Record<string, unknown>);
+    if ("error" in validation) {
+      reply.code(400);
+      return { error: validation.error };
+    }
+
+    const rows = await aggregateLogs(pool, validation.filters);
+
+    const buckets = rows.map((row) => ({
+      start: row.bucket_start.toISOString(),
+      group: row.grp,
+      count: Number(row.count),
+    }));
+
+    return { buckets };
   });
 }

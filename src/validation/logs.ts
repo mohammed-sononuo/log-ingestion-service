@@ -226,3 +226,88 @@ export function validateLogsQuery(query: Record<string, unknown>): LogsQueryResu
 
   return { filters };
 }
+
+// --- GET /logs/aggregate query parsing ---
+
+// Maps the public bucket names to Postgres interval literals for date_bin().
+const BUCKET_INTERVALS: Record<string, string> = {
+  "1m": "1 minute",
+  "5m": "5 minutes",
+  "1h": "1 hour",
+  "1d": "1 day",
+};
+
+export type GroupBy = "service" | "level";
+
+export interface AggregateQueryFilters {
+  service?: string;
+  level?: string;
+  attrs: Record<string, string>;
+  q?: string;
+  since: string;
+  until: string;
+  bucketInterval: string;
+  groupBy?: GroupBy;
+}
+
+export type AggregateQueryResult = { filters: AggregateQueryFilters } | { error: string };
+
+export function validateAggregateQuery(query: Record<string, unknown>): AggregateQueryResult {
+  const since = scalar(query.since);
+  if (since === undefined) return { error: "'since' is required" };
+  if (!ISO_8601_RE.test(since) || Number.isNaN(Date.parse(since))) {
+    return { error: `invalid timestamp for 'since': ${JSON.stringify(since)}` };
+  }
+
+  const until = scalar(query.until);
+  if (until === undefined) return { error: "'until' is required" };
+  if (!ISO_8601_RE.test(until) || Number.isNaN(Date.parse(until))) {
+    return { error: `invalid timestamp for 'until': ${JSON.stringify(until)}` };
+  }
+
+  if (Date.parse(until) < Date.parse(since)) {
+    return { error: "'until' must not be before 'since'" };
+  }
+
+  const bucketRaw = scalar(query.bucket);
+  if (bucketRaw === undefined) return { error: "'bucket' is required" };
+  const bucketInterval = BUCKET_INTERVALS[bucketRaw];
+  if (bucketInterval === undefined) {
+    return { error: `unsupported bucket: ${JSON.stringify(bucketRaw)} (expected one of 1m, 5m, 1h, 1d)` };
+  }
+
+  const filters: AggregateQueryFilters = { attrs: {}, since, until, bucketInterval };
+
+  const service = scalar(query.service);
+  if (service !== undefined) {
+    if (service.length === 0) return { error: "service must not be empty" };
+    filters.service = service;
+  }
+
+  const level = scalar(query.level);
+  if (level !== undefined) {
+    if (!VALID_LEVELS.has(level)) return { error: `unsupported level: ${JSON.stringify(level)}` };
+    filters.level = level;
+  }
+
+  for (const key of Object.keys(query)) {
+    if (!key.startsWith("attr.")) continue;
+    const attrKey = key.slice("attr.".length);
+    if (attrKey.length === 0) continue;
+    const value = scalar(query[key]);
+    if (value !== undefined) filters.attrs[attrKey] = value;
+  }
+
+  const q = scalar(query.q);
+  if (q !== undefined && q.length > 0) filters.q = q;
+
+  const groupBy = scalar(query.group_by);
+  if (groupBy !== undefined) {
+    if (groupBy !== "service" && groupBy !== "level") {
+      return { error: `unsupported group_by: ${JSON.stringify(groupBy)} (expected 'service' or 'level')` };
+    }
+    filters.groupBy = groupBy;
+  }
+
+  return { filters };
+}

@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import type { Attributes, Cursor, LogsQueryFilters } from "../validation/logs";
+import type { AggregateQueryFilters, Attributes, Cursor, LogsQueryFilters } from "../validation/logs";
 
 export interface InsertLogsInput {
   timestamps: string[];
@@ -111,4 +111,77 @@ export async function queryLogs(pool: Pool, filter: LogsQueryFilters): Promise<L
 
 export function cursorFromRow(row: LogRow): Cursor {
   return { timestamp: row.timestamp.toISOString(), id: row.id };
+}
+
+export interface BucketRow {
+  bucket_start: Date;
+  grp: string | null;
+  count: string;
+}
+
+// date_bin's origin is a fixed reference point, not the query's `since` — this
+// keeps bucket boundaries stable (e.g. 1h buckets always land on the hour)
+// regardless of what range the caller happens to query.
+const BUCKET_ORIGIN = "2000-01-01T00:00:00Z";
+
+export function buildAggregateQuery(filter: AggregateQueryFilters): { sql: string; params: unknown[] } {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  params.push(filter.since);
+  conditions.push(`"timestamp" >= $${params.length}::timestamptz`);
+
+  params.push(filter.until);
+  conditions.push(`"timestamp" < $${params.length}::timestamptz`);
+
+  if (filter.service !== undefined) {
+    params.push(filter.service);
+    conditions.push(`service = $${params.length}`);
+  }
+
+  if (filter.level !== undefined) {
+    params.push(filter.level);
+    conditions.push(`level = $${params.length}`);
+  }
+
+  for (const [key, value] of Object.entries(filter.attrs)) {
+    params.push(key);
+    const keyParam = params.length;
+    params.push(value);
+    const valueParam = params.length;
+    conditions.push(`attributes ->> $${keyParam}::text = $${valueParam}::text`);
+  }
+
+  if (filter.q !== undefined) {
+    params.push(filter.q.toLowerCase());
+    conditions.push(`strpos(lower(message), $${params.length}::text) > 0`);
+  }
+
+  params.push(filter.bucketInterval);
+  const bucketParam = params.length;
+  params.push(BUCKET_ORIGIN);
+  const originParam = params.length;
+
+  // groupBy is constrained to the "service" | "level" union by validateAggregateQuery,
+  // so this interpolation is over a fixed enum, never raw request input.
+  const groupExpr = filter.groupBy === undefined ? "NULL::text" : filter.groupBy;
+
+  const sql = `
+    SELECT
+      date_bin($${bucketParam}::interval, "timestamp", $${originParam}::timestamptz) AS bucket_start,
+      ${groupExpr} AS grp,
+      count(*)::bigint AS count
+    FROM logs
+    WHERE ${conditions.join(" AND ")}
+    GROUP BY bucket_start, grp
+    ORDER BY bucket_start ASC, grp ASC
+  `;
+
+  return { sql, params };
+}
+
+export async function aggregateLogs(pool: Pool, filter: AggregateQueryFilters): Promise<BucketRow[]> {
+  const { sql, params } = buildAggregateQuery(filter);
+  const { rows } = await pool.query<BucketRow>(sql, params);
+  return rows;
 }
