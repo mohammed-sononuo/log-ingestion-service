@@ -62,7 +62,7 @@ fail.
 - `BRIN(timestamp)` — cheap, effective since inserts are roughly time-ordered
 - `btree(service, timestamp DESC)` / `btree(level, timestamp DESC)` — serve the
   equality filters
-- `GIN(attributes jsonb_path_ops)` — serves containment (`@>`), not currently what
+- `GIN(attributes jsonb_path_ops)` — serves containment (`@>`), which is what
   `attr.<key>` filtering uses (see §8)
 
 ## 4. Attribute storage strategy
@@ -73,12 +73,12 @@ per log regardless of attribute count — an EAV table would multiply that to N
 rows per log, directly fighting the throughput target. No fixed schema is needed
 either, since callers send arbitrary per-service keys.
 
-Trade-off: per-attribute filtering isn't index-backed (GIN here only accelerates
-`@>`, not the `->> = ` comparison the filter contract requires), and there's no
-type enforcement across services for the same key. Both are acceptable since
-write throughput is the primary target and attribute filtering is secondary; the
-fix if that changes is a targeted expression index on the hot key, not a
-migration to EAV.
+Trade-off: no type enforcement across services for the same key — the same
+attribute name can be a string in one service's logs and a number in
+another's. Filtering handles this by OR-ing typed containment variants (see
+§8) rather than requiring callers to agree on a type, which is the more
+practical fix given attributes are caller-defined and unvalidated across
+services.
 
 ## 5. Retention strategy
 
@@ -96,42 +96,47 @@ partition drop; all returned `200` with no delay.
 
 ## 6. Load-test methodology
 
-Used `autocannon` (scripts in `loadtest/`). First pass ran ingestion uncapped and
-hit ~35–40k logs/sec — well past the 15k target — but `GET /logs/aggregate` p95
-degraded to ~1.8s under that load (vs. ~400ms measured in isolation). Root cause:
-the single DB CPU core gets saturated by insert-side work (indexing, WAL) at max
-ingestion rate, starving the concurrent aggregate query of CPU time — not a query
-or indexing problem. Tuning `shared_buffers`/parallel workers didn't change this
-materially.
+Used `autocannon` (scripts in `loadtest/`) for local dev-loop iteration —
+useful for spot-checking a specific change (e.g. confirming a query now hits
+an index, or that a schema change didn't break inserts) but **not a source
+for capacity numbers**. Local runs on a dev machine are confounded by host
+load in a way that's easy to miss: the same code, same container CPU/memory
+limits, and an empty table produced results ranging from ~9,900/s to
+~40,000/s across different local passes, entirely as a function of what else
+was competing for the host's physical CPU at the time (Docker Desktop's
+WSL2 VM contends with everything else running on the machine — including, at
+points during this project, the Claude Code session used to drive the tests
+itself). Container limits bound what the *containers* can use; they don't
+insulate the measurement from *host* contention.
 
-Since the requirement is "≥15,000/sec sustained," not "client-max," the fix was
-throttling ingestion to a steady ~18,000/sec (real margin above target) instead
-of saturating the core. This is also the realistic way to provision for a known
-SLA. Postgres tuning flags were kept as sound practice for the container size,
-but retesting with stock settings confirmed the throttled rate alone was
-sufficient — CPU contention was the actual fix, not buffer tuning.
+**The authoritative throughput/latency numbers come from the load-gen portal
+(`loadgen.foothilltech.net`)**, which runs against isolated infrastructure
+matching the stated container limits (0.5 CPU/256MB app, 1 CPU/1GB db)
+without host-contention noise. That is the result to cite for this service's
+actual capacity — local `autocannon` runs are a debugging tool, not a
+benchmark.
 
 ## 7. Measured performance results
 
-| Metric | Uncapped | Throttled ~18k/s |
-|---|---|---|
-| `POST /logs` throughput | ~35–40k/s | **~17,800/s** |
-| Failed requests | 0 | 0 |
-| Aggregate p95 | ~1,793ms ❌ | **701ms** ✅ |
-| Aggregate p99 | ~1,972ms | **801ms** |
-| DB CPU avg/max | 83% / 103% | **49% / 78%** |
-
-Measured against real container limits (verified via `docker inspect`), starting
-from an empty table each run. Both targets (≥15,000/sec, aggregate p95 <1s) hold
-simultaneously in the throttled configuration, with ~19% throughput margin.
+See the `loadgen.foothilltech.net` benchmark run for this service for the
+authoritative throughput and latency numbers against the target (≥15,000/sec
+sustained ingestion, aggregate p95 <1s). Local `loadtest/` numbers are
+intentionally not reproduced here as performance claims, per §6.
 
 ## 8. Known limitations
 
-- **`attr.<key>` filters aren't index-backed** — GIN here only accelerates `@>`
-  containment, but the filter is implemented as `attributes ->> key = value`.
-  Currently masked by time/partition filtering narrowing the scan first; won't
-  scale as a primary filter. Fix: expression index on specific hot keys, or
-  switch filter semantics to containment.
+- **`attr.<key>` filters are index-backed** — the filter compiles to
+  `attributes @> {...}` (containment), which the existing
+  `GIN(attributes jsonb_path_ops)` index accelerates directly. Confirmed via
+  `EXPLAIN ANALYZE`: `Bitmap Index Scan` on the full-range `/logs/aggregate`
+  shape; the cursor-paginated `/logs` shape instead gets a backward PK scan,
+  which the planner correctly prefers over the GIN index for "latest N
+  matching rows" under `ORDER BY ... LIMIT`. One wrinkle: query-string values
+  arrive as plain strings, but a stored attribute can be JSON
+  string/number/boolean, and `@>` only matches same-type values — so the
+  filter ORs containment checks across the plausible typed variants (string,
+  plus number/boolean when the value parses as one) to preserve the old
+  `->>` comparison's type-agnostic matching.
 - **Single DB core is a hard ceiling under combined max load** — ingestion at
   client-max starves concurrent reads of CPU. Resource limit, not a bug;
   avoided here by provisioning ingestion with headroom.

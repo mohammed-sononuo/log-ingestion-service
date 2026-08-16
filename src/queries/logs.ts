@@ -1,6 +1,22 @@
 import type { Pool } from "pg";
 import type { AggregateQueryFilters, Attributes, Cursor, LogsQueryFilters } from "../validation/logs";
 
+// Query-string attr values arrive as plain strings, but the stored attribute
+// may be a JSON string, number, or boolean - `@>` containment only matches
+// same-type values, unlike the old `->>` text comparison which coerced both
+// sides to text. Building one containment object per plausible type (as an
+// OR) keeps matching behavior identical while still hitting the GIN index on
+// every branch.
+function attrContainmentVariants(key: string, value: string): string[] {
+  const variants: unknown[] = [value];
+  if (value === "true" || value === "false") {
+    variants.push(value === "true");
+  } else if (/^-?\d+(\.\d+)?$/.test(value)) {
+    variants.push(Number(value));
+  }
+  return variants.map((v) => JSON.stringify({ [key]: v }));
+}
+
 export interface InsertLogsInput {
   timestamps: string[];
   levels: string[];
@@ -61,11 +77,11 @@ export function buildLogsQuery(filter: LogsQueryFilters): { sql: string; params:
   }
 
   for (const [key, value] of Object.entries(filter.attrs)) {
-    params.push(key);
-    const keyParam = params.length;
-    params.push(value);
-    const valueParam = params.length;
-    conditions.push(`attributes ->> $${keyParam}::text = $${valueParam}::text`);
+    const variantConditions = attrContainmentVariants(key, value).map((json) => {
+      params.push(json);
+      return `attributes @> $${params.length}::jsonb`;
+    });
+    conditions.push(`(${variantConditions.join(" OR ")})`);
   }
 
   if (filter.q !== undefined) {
@@ -145,11 +161,11 @@ export function buildAggregateQuery(filter: AggregateQueryFilters): { sql: strin
   }
 
   for (const [key, value] of Object.entries(filter.attrs)) {
-    params.push(key);
-    const keyParam = params.length;
-    params.push(value);
-    const valueParam = params.length;
-    conditions.push(`attributes ->> $${keyParam}::text = $${valueParam}::text`);
+    const variantConditions = attrContainmentVariants(key, value).map((json) => {
+      params.push(json);
+      return `attributes @> $${params.length}::jsonb`;
+    });
+    conditions.push(`(${variantConditions.join(" OR ")})`);
   }
 
   if (filter.q !== undefined) {
