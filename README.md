@@ -123,7 +123,41 @@ authoritative throughput and latency numbers against the target (≥15,000/sec
 sustained ingestion, aggregate p95 <1s). Local `loadtest/` numbers are
 intentionally not reproduced here as performance claims, per §6.
 
-## 8. Known limitations
+## 8. Durability trade-off
+
+The DB runs with `synchronous_commit=off` (set via `command:` flags in
+`docker-compose.yml`, not `postgresql.conf`). `fsync` is left at its default
+(**on**).
+
+**What this actually changes:** with `synchronous_commit=off`, Postgres
+acknowledges a commit to the client as soon as it's written to the WAL
+buffer, without waiting for that WAL to be flushed to disk. `fsync` staying
+on means the background writer/checkpointer still flushes WAL to disk on
+its normal schedule — the database's on-disk state stays internally
+consistent. This is a deliberate choice, and deliberately *not*
+`fsync=off`: `fsync=off` disables the disk-durability guarantee entirely and
+can cause actual data corruption on crash (torn pages, an inconsistent data
+directory that may not even restart cleanly). `synchronous_commit=off` has
+a much narrower blast radius — worst case is losing the last fraction of a
+second of *already-acknowledged* commits if the process crashes at exactly
+the wrong instant; the database itself never becomes corrupt.
+
+**Why this is an acceptable trade-off for this service specifically:** this
+is a log ingestion pipeline, not a system of record for financial or
+transactional data. Losing the last ~200ms of log rows in the rare event of
+a crash is a materially different risk than losing or corrupting a bank
+transaction — the cost of that loss here is "a gap in observability data,"
+not "money moved incorrectly." In exchange, commits no longer block on
+per-transaction disk flushes, which matters directly for the throughput
+target (≥15,000 logs/sec) under the 1 CPU/1GB DB container limit.
+
+**To restore the stronger guarantee:** set `synchronous_commit=on` (or
+remove the flag, since `on` is Postgres' own default) in the `db` service's
+`command:` block in `docker-compose.yml` and re-run
+`docker compose up -d --build`. This reverts to waiting for each commit's
+WAL flush before acknowledging, at the throughput cost measured in §7.
+
+## 9. Known limitations
 
 - **`attr.<key>` filters are index-backed** — the filter compiles to
   `attributes @> {...}` (containment), which the existing
@@ -146,7 +180,7 @@ intentionally not reproduced here as performance claims, per §6.
 - **No caching on aggregate** — repeated identical queries re-scan every time.
 - **A failed partition drop retries only on the next scheduled run** (up to 1h).
 
-## 9. Optional features
+## 10. Optional features
 
 None implemented — no auth, multi-tenancy, or rate limiting. `docker compose up`
 with no configuration runs the full core service as specified above.
